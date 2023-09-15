@@ -1,0 +1,1 @@
+https://github.com/aigc-apps/sd-webui-EasyPhoto
