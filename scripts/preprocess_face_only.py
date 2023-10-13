@@ -11,7 +11,6 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 import cv2
 import numpy as np
 import torch
-from face_process_utils import call_face_crop
 from modelscope.outputs import OutputKeys
 from modelscope.pipelines import pipeline
 from modelscope.utils.constant import Tasks
@@ -60,13 +59,6 @@ def parse_args():
             "The inputs dir of the data for preprocessing."
         ),
     )
-    parser.add_argument(
-        "--skin_retouching_bool",
-        action="store_true",
-        help=(
-            "Whether to use beauty"
-        ),
-    )
     args = parser.parse_args()
     return args
 
@@ -87,25 +79,19 @@ if __name__ == "__main__":
     validation_prompt   = args.validation_prompt
     inputs_dir          = args.inputs_dir
     ref_image_path      = args.ref_image_path
-    skin_retouching_bool= args.skin_retouching_bool
 
-    logging.info(
-        f'''
-        preprocess params:
-        images_save_path     = {images_save_path}
-        json_save_path       = {json_save_path}
-        validation_prompt    = {validation_prompt}
-        inputs_dir           = {inputs_dir}
-        ref_image_path       = {ref_image_path}
-        skin_retouching_bool = {skin_retouching_bool}
-        '''
-    )
     # embedding
     face_recognition        = pipeline("face_recognition", model='bubbliiiing/cv_retinafce_recognition', model_revision='v1.0.3')
     # face detection
     retinaface_detection    = pipeline(Tasks.face_detection, 'damo/cv_resnet50_face-detection_retinaface', model_revision='v2.0.2')
-    # semantic segmentation
-    salient_detect          = pipeline(Tasks.semantic_segmentation, 'damo/cv_u2net_salient-detection', model_revision='v1.0.0')
+
+    try:
+        face_skin           = Face_Skin(os.path.join(os.path.abspath(os.path.dirname(__file__)).replace("scripts", "models"), "face_skin.pth"))
+        salient_detect      = None
+    except:
+        face_skin           = None
+        salient_detect      = pipeline(Tasks.semantic_segmentation, 'damo/cv_u2net_salient-detection', model_revision='v1.0.0')
+
     # skin retouching
     try:
         skin_retouching     = pipeline('skin-retouching-torch', model='damo/cv_unet_skin_retouching_torch', model_revision='v1.0.2')
@@ -157,12 +143,11 @@ if __name__ == "__main__":
 
             # face crop
             sub_image = image.crop(retinaface_box)
-            if skin_retouching_bool:
-                try:
-                    sub_image = Image.fromarray(cv2.cvtColor(skin_retouching(sub_image)[OutputKeys.OUTPUT_IMG], cv2.COLOR_BGR2RGB))
-                except Exception as e:
-                    torch.cuda.empty_cache()
-                    logging.error(f"Photo skin_retouching error, error info: {e}")
+            try:
+                sub_image           = Image.fromarray(cv2.cvtColor(skin_retouching(sub_image)[OutputKeys.OUTPUT_IMG], cv2.COLOR_BGR2RGB))
+            except Exception as e:
+                torch.cuda.empty_cache()
+                logging.error(f"Photo skin_retouching error, error info: {e}")
 
             # get embedding
             embedding = face_recognition(dict(user=image))[OutputKeys.IMG_EMBEDDING]
@@ -212,24 +197,31 @@ if __name__ == "__main__":
                 torch.cuda.empty_cache()
                 logging.error(f"Photo enhance error, error info: {e}")
 
-            # Correct the mask area of the face
-            sub_boxes, _, sub_masks = call_face_crop(retinaface_detection, sub_image, 1, prefix="tmp")
-            sub_box     = sub_boxes[0]
-            sub_mask    = sub_masks[0]
+            if face_skin is not None:
+                # Significance detection, merging facial masks
+                ratio = int(min(np.shape(sub_image)[0], np.shape(sub_image)[1]) // 5)
+                mask = np.uint8(np.float32(face_skin(sub_image, retinaface_detection, needs_index=[[1, 2, 3, 4, 5, 7, 8, 10, 12, 13]])[0]) > 128)
+                mask = np.uint8(cv2.erode(cv2.dilate(mask, np.ones((ratio, ratio), np.uint8), iterations=1), np.ones((ratio, ratio), np.uint8), iterations=1))
 
-            h, w, c     = np.shape(sub_mask)
-            face_width  = sub_box[2] - sub_box[0]
-            face_height = sub_box[3] - sub_box[1]
-            sub_box[0]  = np.clip(np.array(sub_box[0], np.int32) - face_width * 0.3, 1, w - 1)
-            sub_box[2]  = np.clip(np.array(sub_box[2], np.int32) + face_width * 0.3, 1, w - 1)
-            sub_box[1]  = np.clip(np.array(sub_box[1], np.int32) + face_height * 0.15, 1, h - 1)
-            sub_box[3]  = np.clip(np.array(sub_box[3], np.int32) + face_height * 0.15, 1, h - 1)
-            sub_mask    = np.zeros_like(np.array(sub_mask, np.uint8))
-            sub_mask[sub_box[1]:sub_box[3], sub_box[0]:sub_box[2]] = 1
+            else:
+                # Correct the mask area of the face
+                sub_boxes, _, sub_masks = call_face_crop(retinaface_detection, sub_image, 1, prefix="tmp")
+                sub_box     = sub_boxes[0]
+                sub_mask    = sub_masks[0]
 
-            # Significance detection, merging facial masks
-            result      = salient_detect(sub_image)[OutputKeys.MASKS]
-            mask        = np.float32(np.expand_dims(result > 128, -1)) * sub_mask
+                h, w, c     = np.shape(sub_mask)
+                face_width  = sub_box[2] - sub_box[0]
+                face_height = sub_box[3] - sub_box[1]
+                sub_box[0]  = np.clip(np.array(sub_box[0], np.int32) - face_width * 0.3, 1, w - 1)
+                sub_box[2]  = np.clip(np.array(sub_box[2], np.int32) + face_width * 0.3, 1, w - 1)
+                sub_box[1]  = np.clip(np.array(sub_box[1], np.int32) + face_height * 0.15, 1, h - 1)
+                sub_box[3]  = np.clip(np.array(sub_box[3], np.int32) + face_height * 0.15, 1, h - 1)
+                sub_mask    = np.zeros_like(np.array(sub_mask, np.uint8))
+                sub_mask[sub_box[1]:sub_box[3], sub_box[0]:sub_box[2]] = 1
+
+                # Significance detection, merging facial masks
+                result      = salient_detect(sub_image)[OutputKeys.MASKS]
+                mask        = np.float32(np.expand_dims(result > 128, -1)) * sub_mask
 
             # Obtain the image after the mask
             mask_sub_image = np.array(sub_image) * np.array(mask) + np.ones_like(sub_image) * 255 * (1 - np.array(mask))
@@ -268,6 +260,7 @@ if __name__ == "__main__":
                         f.write("\n")
 
     del retinaface_detection
+    del face_skin
     del salient_detect
     del skin_retouching
     del portrait_enhancement

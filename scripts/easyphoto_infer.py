@@ -2,6 +2,7 @@ import copy
 import glob
 import logging
 import os
+import sys
 
 import cv2
 import numpy as np
@@ -24,7 +25,6 @@ from scripts.face_process_utils import (Face_Skin, call_face_crop,
                                         color_transfer, crop_and_paste)
 from scripts.sdwebui import ControlNetUnit, i2i_inpaint_call, t2i_call
 from scripts.train_kohya.utils.gpu_info import gpu_monitor_decorator
-
 
 def resize_image(input_image, resolution, nearest = False, crop264 = True):
     H, W, C = input_image.shape
@@ -200,7 +200,7 @@ check_hash = True
 def easyphoto_infer_forward(
     sd_model_checkpoint, selected_template_images, init_image, uploaded_template_images, additional_prompt, \
     before_face_fusion_ratio, after_face_fusion_ratio, first_diffusion_steps, first_denoising_strength, second_diffusion_steps, second_denoising_strength, \
-    seed, crop_face_preprocess, apply_face_fusion_before, apply_face_fusion_after, color_shift_middle, color_shift_last, super_resolution, display_score, \
+    seed, crop_face_preprocess, apply_face_fusion_before, apply_face_fusion_after, color_shift_middle, color_shift_last, super_resolution, skin_retouching_bool, display_score, \
     background_restore, background_restore_denoising_strength, sd_xl_input_prompt, sd_xl_resolution, tabs, *user_ids,
 ): 
     # global
@@ -507,7 +507,9 @@ def easyphoto_infer_forward(
                     first_diffusion_output_image_crop_color_shift = color_transfer(first_diffusion_output_image_crop_color_shift, template_image_original_face_area)
                     
                     # detect face area
-                    face_skin_mask = np.int32(np.float32(face_skin(first_diffusion_output_image_crop, retinaface_detection, needs_index=[[1, 2, 3, 4, 5, 10, 12, 13]])[0]) > 128)
+                    face_skin_mask = np.float32(face_skin(first_diffusion_output_image_crop, retinaface_detection, needs_index=[[1, 2, 3, 4, 5, 10, 12, 13]])[0])
+                    face_skin_mask = cv2.blur(face_skin_mask, (32, 32)) / 255
+                    
                     # paste back to photo
                     first_diffusion_output_image_uint8[input_image_retinaface_box[1]:input_image_retinaface_box[3], input_image_retinaface_box[0]:input_image_retinaface_box[2],:] = \
                         first_diffusion_output_image_crop_color_shift * face_skin_mask + np.array(first_diffusion_output_image_crop) * (1 - face_skin_mask)
@@ -564,12 +566,14 @@ def easyphoto_infer_forward(
                     second_diffusion_output_image_crop_color_shift = color_transfer(second_diffusion_output_image_crop_color_shift, template_image_original_face_area)
 
                     # detect face area
-                    face_skin_mask = np.int32(np.float32(face_skin(second_diffusion_output_image_crop, retinaface_detection, needs_index=[[1, 2, 3, 4, 5, 10]])[0]) > 128)
+                    face_skin_mask = np.float32(face_skin(second_diffusion_output_image_crop, retinaface_detection, needs_index=[[1, 2, 3, 4, 5, 10]])[0])
+                    face_skin_mask = cv2.blur(face_skin_mask, (32, 32)) / 255
+
                     # paste back to photo
                     second_diffusion_output_image_uint8[rescale_retinaface_box[1]:rescale_retinaface_box[3], rescale_retinaface_box[0]:rescale_retinaface_box[2],:] = \
                         second_diffusion_output_image_crop_color_shift * face_skin_mask + np.array(second_diffusion_output_image_crop) * (1 - face_skin_mask)
                     second_diffusion_output_image = Image.fromarray(second_diffusion_output_image_uint8)
-                    
+
                 # If it is a large template for cutting, paste the reconstructed image back
                 if crop_face_preprocess:
                     logging.info("Start paste crop image to origin template.")
@@ -625,14 +629,15 @@ def easyphoto_infer_forward(
                 torch.cuda.empty_cache()
                 logging.error(f"Background Restore Failed, Please check the ratio of height and width in template. Error Info: {e}")
                 return f"Background Restore Failed, Please check the ratio of height and width in template. Error Info: {e}", outputs, []
-            
-            try:
-                logging.info("Start Skin Retouching.")
-                # Skin Retouching is performed here. 
-                output_image = Image.fromarray(cv2.cvtColor(skin_retouching(output_image)[OutputKeys.OUTPUT_IMG], cv2.COLOR_BGR2RGB))
-            except Exception as e:
-                torch.cuda.empty_cache()
-                logging.error(f"Skin Retouching error: {e}")
+
+            if skin_retouching_bool:
+                try:
+                    logging.info("Start Skin Retouching.")
+                    # Skin Retouching is performed here. 
+                    output_image = Image.fromarray(cv2.cvtColor(skin_retouching(output_image)[OutputKeys.OUTPUT_IMG], cv2.COLOR_BGR2RGB))  
+                except Exception as e:
+                    torch.cuda.empty_cache()
+                    logging.error(f"Skin Retouching error: {e}")
 
             try:
                 logging.info("Start Portrait enhancement.")
