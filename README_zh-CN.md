@@ -36,6 +36,7 @@ EasyPhoto是一款Webui UI插件，用于生成AI肖像画，该代码可用于�
 我们现在支持从不同平台快速启动，请参阅 [快速启动](#快速启动)。
 
 新特性：
+- ComfyUI 支持 [repo](https://github.com/THtianhao/ComfyUI-Portrait-Maker), 感谢[THtianhao](https://github.com/THtianhao)的精彩工作![🔥 🔥 🔥 2023.10.17]
 - EasyPhoto 论文地址 [arxiv](https://arxiv.org/abs/2310.04672)[🔥 🔥 🔥 2023.10.10]
 - 支持使用SDXL模型和一定的选项直接生成高清大图，不再需要上传模板，需要16GB显存。具体细节可以前往[这里](https://zhuanlan.zhihu.com/p/658940203)[🔥 🔥 🔥 2023.09.26]
 - 我们同样支持[Diffusers版本](https://github.com/aigc-apps/EasyPhoto/)。 [🔥 2023.09.25]
@@ -241,9 +242,9 @@ EasyPhoto训练界面如下：
 本项目采用 [Apache License (Version 2.0)](https://github.com/modelscope/modelscope/blob/master/LICENSE).
 
 # 联系我们
-1. 使用[钉钉](https://www.dingtalk.com/)搜索群38250008552或扫描下列二维码加入群聊
+1. 使用[钉钉](https://www.dingtalk.com/)搜索2群54095000124或扫描下列二维码加入群聊
 2. 由于 微信群 已经满了，需要扫描右边的图片先添加这个同学为好友，然后再加入 微信群 。
 <figure>
-<img src="images/erweima.jpg" width=300/>
+<img src="images/ding_erweima.jpg" width=300/>
 <img src="images/wechat.jpg" width=300/>
 </figure>
