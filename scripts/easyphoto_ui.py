@@ -7,10 +7,15 @@ import requests
 from modules import script_callbacks, shared
 
 from scripts.easyphoto_config import (cache_log_file_path, models_path,
-                                      user_id_outpath_samples)
+                                      user_id_outpath_samples,easyphoto_outpath_samples)
 from scripts.easyphoto_infer import easyphoto_infer_forward
 from scripts.easyphoto_train import easyphoto_train_forward
 from scripts.easyphoto_utils import check_id_valid
+from scripts.sdwebui import get_checkpoint_type
+
+from modules.ui_components import ToolButton as ToolButton_webui
+import modules.generation_parameters_copypaste as parameters_copypaste
+
 
 gradio_compat = True
 
@@ -131,6 +136,13 @@ def on_ui_tabs():
                                     inputs=[],
                                     outputs=[sd_model_checkpoint]
                                 )
+                            
+                            with gr.Row():
+                                sdxl_wiki_url = "https://github.com/aigc-apps/sd-webui-EasyPhoto/wiki#4sdxl-training"
+                                sdxl_training_note = gr.Markdown(
+                                    value = "**Please check the [[wiki]]({}) before SDXL training**.".format(sdxl_wiki_url),
+                                    visible=False
+                                )
 
                             with gr.Row():
                                 resolution = gr.Textbox(
@@ -161,7 +173,7 @@ def on_ui_tabs():
                                     interactive=True
                                 )
                                 gradient_accumulation_steps = gr.Textbox(
-                                    label="gradient accumulationsteps",
+                                    label="gradient accumulation steps",
                                     value=4,
                                     interactive=True
                                 )
@@ -222,9 +234,23 @@ def on_ui_tabs():
                             enable_rl.change(lambda x: rl_option_row1.update(visible=x), inputs=[enable_rl], outputs=[rl_option_row1])
                             enable_rl.change(lambda x: rl_option_row1.update(visible=x), inputs=[enable_rl], outputs=[rl_notes])
 
+                            # We will update the default training parameters by the checkpoint type. 
+                            def update_train_parameters(sd_model_checkpoint):
+                                checkpoint_type = get_checkpoint_type(sd_model_checkpoint)
+                                if checkpoint_type == 3:  # SDXL
+                                    return gr.Markdown.update(visible=True), 1024, 600, 32, 16, gr.Checkbox.update(value=False)
+                                return gr.Markdown.update(visible=False), 512, 800, 128, 64, gr.Checkbox.update(value=True)
+                            
+                            sd_model_checkpoint.change(
+                                fn=update_train_parameters,
+                                inputs=sd_model_checkpoint,
+                                outputs=[sdxl_training_note, resolution, max_train_steps, rank, network_alpha, validation]
+                            )
+
                         gr.Markdown(
                             '''
                             Parameter parsing:
+                            - **The base checkpoint** can be SD1 or SDXL.
                             - **max steps per photo** represents the maximum number of training steps per photo.
                             - **max train steps** represents the maximum training step.
                             - **Validation** Whether to validate at training time.
@@ -305,7 +331,7 @@ def on_ui_tabs():
 
                             upload_dir_button.upload(upload_file, inputs=[upload_dir_button, uploaded_template_images], outputs=uploaded_template_images, queue=False)
 
-                        with gr.TabItem("SDXL-beta") as generate_tab:
+                        with gr.TabItem("text2photo") as generate_tab:
                             
                             sd_xl_resolution  = gr.Dropdown(
                                 value="(1344, 768)", elem_id='dropdown', 
@@ -385,6 +411,20 @@ def on_ui_tabs():
                                 inputs=[],
                                 outputs=[sd_model_checkpoint]
                             )
+
+                        with gr.Row():
+                            infer_note = gr.Markdown(
+                                value = "For faster speed, keep the same with Stable Diffusion checkpoint (in the upper left corner).",
+                                visible=(sd_model_checkpoint != shared.opts.sd_model_checkpoint.split(" ")[0])
+                            )
+                        
+                            def update_infer_note(sd_model_checkpoint):
+                                # shared.opts.sd_model_checkpoint has a hash tag like "sd_xl_base_1.0.safetensors [31e35c80fc]".
+                                if sd_model_checkpoint == shared.opts.sd_model_checkpoint.split(" ")[0]:
+                                    return gr.Markdown.update(visible=False)
+                                return gr.Markdown.update(visible=True)
+                            
+                            sd_model_checkpoint.change(fn=update_infer_note, inputs=sd_model_checkpoint, outputs=[infer_note])
 
                         with gr.Row():
                             def select_function():
@@ -563,6 +603,21 @@ def on_ui_tabs():
                             label='Output',
                             show_label=False
                         ).style(columns=[4], rows=[2], object_fit="contain", height="auto")
+
+                        with gr.Row():
+                            tabname = 'easyphoto'
+                            buttons = {
+                                'img2img': ToolButton_webui('🖼️', elem_id=f'{tabname}_send_to_img2img', tooltip="Send image and generation parameters to img2img tab."),
+                                'inpaint': ToolButton_webui('🎨️', elem_id=f'{tabname}_send_to_inpaint', tooltip="Send image and generation parameters to img2img inpaint tab."),
+                                'extras': ToolButton_webui('📐', elem_id=f'{tabname}_send_to_extras', tooltip="Send image and generation parameters to extras tab.")
+                            }
+
+                        for paste_tabname, paste_button in buttons.items():
+                            parameters_copypaste.register_paste_params_button(parameters_copypaste.ParamBinding(
+                                paste_button=paste_button, tabname=paste_tabname, source_tabname="txt2img" if tabname == "txt2img" else None, source_image_component=output_images,
+                                paste_field_names=[]
+                            ))
+
 
                         face_id_text    = gr.Markdown("Face Similarity Scores", visible=False)
                         face_id_outputs = gr.Gallery(
