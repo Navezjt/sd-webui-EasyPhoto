@@ -53,7 +53,10 @@ def post(encoded_image, user_id=None, url='http://0.0.0.0:7860'):
         "makeup_transfer"           : False,
         "makeup_transfer_ratio"     : 0.50,
         "face_shape_match"          : False,
-        "tabs"                      : 1
+        "tabs"                      : 1,
+        "ip_adapter_control"        : True,
+        "ip_adapter_weight"         : 0.5,
+        "ipa_image_path"            : None,
     })
     r = requests.post(f'{url}/easyphoto/easyphoto_infer_forward', data=datas, timeout=1500)
     data = r.content.decode('utf-8')
@@ -94,7 +97,7 @@ if __name__ == '__main__':
         outputs = post(encoded_image)
         outputs = json.loads(outputs)
         image = decode_image_from_base64jpeg(outputs["outputs"][0])
-        toutput_path = os.path.join(os.path.join(output_path), img_path.split('/')[-1])
+        toutput_path = os.path.join(os.path.join(output_path), "tmp.jpg")
         cv2.imwrite(toutput_path, image)
 
     # When selecting a local file as a parameter input.
