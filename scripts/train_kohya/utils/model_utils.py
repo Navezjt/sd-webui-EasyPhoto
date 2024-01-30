@@ -1,11 +1,19 @@
-import math
+# Borrow from https://github.com/bmaltais/kohya_ss/blob/master/library/model_util.py
+# v1: split from train_db_fixed.py.
+# v2: support safetensors
 import os
-import torch
-import diffusers
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextConfig, logging
-from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
-from safetensors.torch import load_file
+from typing import List
 
+import diffusers
+import torch
+from accelerate import init_empty_weights
+from accelerate.utils.modeling import set_module_tensor_to_device
+from diffusers import AutoencoderKL
+from safetensors.torch import load_file
+from transformers import CLIPTextConfig, CLIPTextModel, CLIPTextModelWithProjection
+
+from .original_unet import UNet2DConditionModel
+from .original_unet_sd_XL import SdxlUNet2DConditionModel
 
 UNET_PARAMS_MODEL_CHANNELS = 320
 UNET_PARAMS_CHANNEL_MULT = [1, 2, 4, 4]
@@ -142,9 +150,7 @@ def renew_vae_attention_paths(old_list, n_shave_prefix_segments=0):
     return mapping
 
 
-def assign_to_checkpoint(
-    paths, checkpoint, old_checkpoint, attention_paths_to_split=None, additional_replacements=None, config=None
-):
+def assign_to_checkpoint(paths, checkpoint, old_checkpoint, attention_paths_to_split=None, additional_replacements=None, config=None):
     """
     This does the final conversion step: take locally converted weights and apply a global renaming
     to them. It splits attention layers, and takes into account additional replacements
@@ -277,9 +283,7 @@ def convert_ldm_unet_checkpoint(v2, checkpoint, config):
         attentions = [key for key in input_blocks[i] if f"input_blocks.{i}.1" in key]
 
         if f"input_blocks.{i}.0.op.weight" in unet_state_dict:
-            new_checkpoint[f"down_blocks.{block_id}.downsamplers.0.conv.weight"] = unet_state_dict.pop(
-                f"input_blocks.{i}.0.op.weight"
-            )
+            new_checkpoint[f"down_blocks.{block_id}.downsamplers.0.conv.weight"] = unet_state_dict.pop(f"input_blocks.{i}.0.op.weight")
             new_checkpoint[f"down_blocks.{block_id}.downsamplers.0.conv.bias"] = unet_state_dict.pop(f"input_blocks.{i}.0.op.bias")
 
         paths = renew_resnet_paths(resnets)
@@ -328,17 +332,13 @@ def convert_ldm_unet_checkpoint(v2, checkpoint, config):
             meta_path = {"old": f"output_blocks.{i}.0", "new": f"up_blocks.{block_id}.resnets.{layer_in_block_id}"}
             assign_to_checkpoint(paths, new_checkpoint, unet_state_dict, additional_replacements=[meta_path], config=config)
 
-            for l in output_block_list.values():
-                l.sort()
+            for output_block in output_block_list.values():
+                output_block.sort()
 
             if ["conv.bias", "conv.weight"] in output_block_list.values():
                 index = list(output_block_list.values()).index(["conv.bias", "conv.weight"])
-                new_checkpoint[f"up_blocks.{block_id}.upsamplers.0.conv.bias"] = unet_state_dict[
-                    f"output_blocks.{i}.{index}.conv.bias"
-                ]
-                new_checkpoint[f"up_blocks.{block_id}.upsamplers.0.conv.weight"] = unet_state_dict[
-                    f"output_blocks.{i}.{index}.conv.weight"
-                ]
+                new_checkpoint[f"up_blocks.{block_id}.upsamplers.0.conv.bias"] = unet_state_dict[f"output_blocks.{i}.{index}.conv.bias"]
+                new_checkpoint[f"up_blocks.{block_id}.upsamplers.0.conv.weight"] = unet_state_dict[f"output_blocks.{i}.{index}.conv.weight"]
 
                 # Clear attentions as they have been attributed above.
                 if len(attentions) == 2:
@@ -441,9 +441,7 @@ def convert_ldm_vae_checkpoint(checkpoint, config):
             new_checkpoint[f"decoder.up_blocks.{i}.upsamplers.0.conv.weight"] = vae_state_dict[
                 f"decoder.up.{block_id}.upsample.conv.weight"
             ]
-            new_checkpoint[f"decoder.up_blocks.{i}.upsamplers.0.conv.bias"] = vae_state_dict[
-                f"decoder.up.{block_id}.upsample.conv.bias"
-            ]
+            new_checkpoint[f"decoder.up_blocks.{i}.upsamplers.0.conv.bias"] = vae_state_dict[f"decoder.up.{block_id}.upsample.conv.bias"]
 
         paths = renew_vae_resnet_paths(resnets)
         meta_path = {"old": f"up.{block_id}.block", "new": f"up_blocks.{i}.resnets"}
@@ -561,15 +559,15 @@ def convert_ldm_clip_checkpoint_v2(checkpoint, max_length):
             elif ".attn.out_proj" in key:
                 key = key.replace(".attn.out_proj.", ".self_attn.out_proj.")
             elif ".attn.in_proj" in key:
-                key = None  
+                key = None
             else:
                 raise ValueError(f"unexpected key in SD: {key}")
         elif ".positional_embedding" in key:
             key = key.replace(".positional_embedding", ".embeddings.position_embedding.weight")
         elif ".text_projection" in key:
-            key = None  
+            key = None
         elif ".logit_scale" in key:
-            key = None  
+            key = None
         elif ".token_embedding" in key:
             key = key.replace(".token_embedding.weight", ".embeddings.token_embedding.weight")
         elif ".ln_final" in key:
@@ -613,193 +611,6 @@ def convert_ldm_clip_checkpoint_v2(checkpoint, max_length):
 
     new_sd["text_model.embeddings.position_ids"] = position_ids
     return new_sd
-
-
-def controlnet_conversion_map():
-    unet_conversion_map = [
-        ("time_embed.0.weight", "time_embedding.linear_1.weight"),
-        ("time_embed.0.bias", "time_embedding.linear_1.bias"),
-        ("time_embed.2.weight", "time_embedding.linear_2.weight"),
-        ("time_embed.2.bias", "time_embedding.linear_2.bias"),
-        ("input_blocks.0.0.weight", "conv_in.weight"),
-        ("input_blocks.0.0.bias", "conv_in.bias"),
-        ("middle_block_out.0.weight", "controlnet_mid_block.weight"),
-        ("middle_block_out.0.bias", "controlnet_mid_block.bias"),
-    ]
-
-    unet_conversion_map_resnet = [
-        ("in_layers.0", "norm1"),
-        ("in_layers.2", "conv1"),
-        ("out_layers.0", "norm2"),
-        ("out_layers.3", "conv2"),
-        ("emb_layers.1", "time_emb_proj"),
-        ("skip_connection", "conv_shortcut"),
-    ]
-
-    unet_conversion_map_layer = []
-    for i in range(4):
-        for j in range(2):
-            hf_down_res_prefix = f"down_blocks.{i}.resnets.{j}."
-            sd_down_res_prefix = f"input_blocks.{3*i + j + 1}.0."
-            unet_conversion_map_layer.append((sd_down_res_prefix, hf_down_res_prefix))
-
-            if i < 3:
-                hf_down_atn_prefix = f"down_blocks.{i}.attentions.{j}."
-                sd_down_atn_prefix = f"input_blocks.{3*i + j + 1}.1."
-                unet_conversion_map_layer.append((sd_down_atn_prefix, hf_down_atn_prefix))
-
-        if i < 3:
-            hf_downsample_prefix = f"down_blocks.{i}.downsamplers.0.conv."
-            sd_downsample_prefix = f"input_blocks.{3*(i+1)}.0.op."
-            unet_conversion_map_layer.append((sd_downsample_prefix, hf_downsample_prefix))
-
-    hf_mid_atn_prefix = "mid_block.attentions.0."
-    sd_mid_atn_prefix = "middle_block.1."
-    unet_conversion_map_layer.append((sd_mid_atn_prefix, hf_mid_atn_prefix))
-
-    for j in range(2):
-        hf_mid_res_prefix = f"mid_block.resnets.{j}."
-        sd_mid_res_prefix = f"middle_block.{2*j}."
-        unet_conversion_map_layer.append((sd_mid_res_prefix, hf_mid_res_prefix))
-
-    controlnet_cond_embedding_names = ["conv_in"] + [f"blocks.{i}" for i in range(6)] + ["conv_out"]
-    for i, hf_prefix in enumerate(controlnet_cond_embedding_names):
-        hf_prefix = f"controlnet_cond_embedding.{hf_prefix}."
-        sd_prefix = f"input_hint_block.{i*2}."
-        unet_conversion_map_layer.append((sd_prefix, hf_prefix))
-
-    for i in range(12):
-        hf_prefix = f"controlnet_down_blocks.{i}."
-        sd_prefix = f"zero_convs.{i}.0."
-        unet_conversion_map_layer.append((sd_prefix, hf_prefix))
-
-    return unet_conversion_map, unet_conversion_map_resnet, unet_conversion_map_layer
-
-
-def convert_controlnet_state_dict_to_sd(controlnet_state_dict):
-    unet_conversion_map, unet_conversion_map_resnet, unet_conversion_map_layer = controlnet_conversion_map()
-
-    mapping = {k: k for k in controlnet_state_dict.keys()}
-    for sd_name, diffusers_name in unet_conversion_map:
-        mapping[diffusers_name] = sd_name
-    for k, v in mapping.items():
-        if "resnets" in k:
-            for sd_part, diffusers_part in unet_conversion_map_resnet:
-                v = v.replace(diffusers_part, sd_part)
-            mapping[k] = v
-    for k, v in mapping.items():
-        for sd_part, diffusers_part in unet_conversion_map_layer:
-            v = v.replace(diffusers_part, sd_part)
-        mapping[k] = v
-    new_state_dict = {v: controlnet_state_dict[k] for k, v in mapping.items()}
-    return new_state_dict
-
-
-def convert_controlnet_state_dict_to_diffusers(controlnet_state_dict):
-    unet_conversion_map, unet_conversion_map_resnet, unet_conversion_map_layer = controlnet_conversion_map()
-
-    mapping = {k: k for k in controlnet_state_dict.keys()}
-    for sd_name, diffusers_name in unet_conversion_map:
-        mapping[sd_name] = diffusers_name
-    for k, v in mapping.items():
-        for sd_part, diffusers_part in unet_conversion_map_layer:
-            v = v.replace(sd_part, diffusers_part)
-        mapping[k] = v
-    for k, v in mapping.items():
-        if "resnets" in v:
-            for sd_part, diffusers_part in unet_conversion_map_resnet:
-                v = v.replace(sd_part, diffusers_part)
-            mapping[k] = v
-    new_state_dict = {v: controlnet_state_dict[k] for k, v in mapping.items()}
-    return new_state_dict
-
-
-# ================#
-# VAE Conversion #
-# ================#
-
-
-def reshape_weight_for_sd(w):
-    # convert HF linear weights to SD conv2d weights
-    return w.reshape(*w.shape, 1, 1)
-
-
-def convert_vae_state_dict(vae_state_dict):
-    vae_conversion_map = [
-        # (stable-diffusion, HF Diffusers)
-        ("nin_shortcut", "conv_shortcut"),
-        ("norm_out", "conv_norm_out"),
-        ("mid.attn_1.", "mid_block.attentions.0."),
-    ]
-
-    for i in range(4):
-        # down_blocks have two resnets
-        for j in range(2):
-            hf_down_prefix = f"encoder.down_blocks.{i}.resnets.{j}."
-            sd_down_prefix = f"encoder.down.{i}.block.{j}."
-            vae_conversion_map.append((sd_down_prefix, hf_down_prefix))
-
-        if i < 3:
-            hf_downsample_prefix = f"down_blocks.{i}.downsamplers.0."
-            sd_downsample_prefix = f"down.{i}.downsample."
-            vae_conversion_map.append((sd_downsample_prefix, hf_downsample_prefix))
-
-            hf_upsample_prefix = f"up_blocks.{i}.upsamplers.0."
-            sd_upsample_prefix = f"up.{3-i}.upsample."
-            vae_conversion_map.append((sd_upsample_prefix, hf_upsample_prefix))
-
-        # up_blocks have three resnets
-        # also, up blocks in hf are numbered in reverse from sd
-        for j in range(3):
-            hf_up_prefix = f"decoder.up_blocks.{i}.resnets.{j}."
-            sd_up_prefix = f"decoder.up.{3-i}.block.{j}."
-            vae_conversion_map.append((sd_up_prefix, hf_up_prefix))
-
-    # this part accounts for mid blocks in both the encoder and the decoder
-    for i in range(2):
-        hf_mid_res_prefix = f"mid_block.resnets.{i}."
-        sd_mid_res_prefix = f"mid.block_{i+1}."
-        vae_conversion_map.append((sd_mid_res_prefix, hf_mid_res_prefix))
-
-    if diffusers.__version__ < "0.17.0":
-        vae_conversion_map_attn = [
-            # (stable-diffusion, HF Diffusers)
-            ("norm.", "group_norm."),
-            ("q.", "query."),
-            ("k.", "key."),
-            ("v.", "value."),
-            ("proj_out.", "proj_attn."),
-        ]
-    else:
-        vae_conversion_map_attn = [
-            # (stable-diffusion, HF Diffusers)
-            ("norm.", "group_norm."),
-            ("q.", "to_q."),
-            ("k.", "to_k."),
-            ("v.", "to_v."),
-            ("proj_out.", "to_out.0."),
-        ]
-
-    mapping = {k: k for k in vae_state_dict.keys()}
-    for k, v in mapping.items():
-        for sd_part, hf_part in vae_conversion_map:
-            v = v.replace(hf_part, sd_part)
-        mapping[k] = v
-    for k, v in mapping.items():
-        if "attentions" in k:
-            for sd_part, hf_part in vae_conversion_map_attn:
-                v = v.replace(hf_part, sd_part)
-            mapping[k] = v
-    new_state_dict = {v: vae_state_dict[k] for k, v in mapping.items()}
-    weights_to_convert = ["q", "k", "v", "proj_out"]
-    for k, v in new_state_dict.items():
-        for weight_name in weights_to_convert:
-            if f"mid.attn_1.{weight_name}.weight" in k:
-                # print(f"Reshaping {k} for SD format: shape {v.shape} -> {v.shape} x 1 x 1")
-                new_state_dict[k] = reshape_weight_for_sd(v)
-
-    return new_state_dict
-
 
 
 def is_safetensors(path):
@@ -910,3 +721,225 @@ def load_models_from_stable_diffusion_checkpoint(v2, ckpt_path, device="cpu", dt
     print("loading text encoder:", info)
 
     return text_model, vae, unet
+
+
+def convert_sdxl_text_encoder_2_checkpoint(checkpoint, max_length):
+    SDXL_KEY_PREFIX = "conditioner.embedders.1.model."
+
+    def convert_key(key):
+        # common conversion
+        key = key.replace(SDXL_KEY_PREFIX + "transformer.", "text_model.encoder.")
+        key = key.replace(SDXL_KEY_PREFIX, "text_model.")
+
+        if "resblocks" in key:
+            # resblocks conversion
+            key = key.replace(".resblocks.", ".layers.")
+            if ".ln_" in key:
+                key = key.replace(".ln_", ".layer_norm")
+            elif ".mlp." in key:
+                key = key.replace(".c_fc.", ".fc1.")
+                key = key.replace(".c_proj.", ".fc2.")
+            elif ".attn.out_proj" in key:
+                key = key.replace(".attn.out_proj.", ".self_attn.out_proj.")
+            elif ".attn.in_proj" in key:
+                key = None
+            else:
+                raise ValueError(f"unexpected key in SD: {key}")
+        elif ".positional_embedding" in key:
+            key = key.replace(".positional_embedding", ".embeddings.position_embedding.weight")
+        elif ".text_projection" in key:
+            key = key.replace("text_model.text_projection", "text_projection.weight")
+        elif ".logit_scale" in key:
+            key = None
+        elif ".token_embedding" in key:
+            key = key.replace(".token_embedding.weight", ".embeddings.token_embedding.weight")
+        elif ".ln_final" in key:
+            key = key.replace(".ln_final", ".final_layer_norm")
+        # ckpt from comfy has this key: text_model.encoder.text_model.embeddings.position_ids
+        elif ".embeddings.position_ids" in key:
+            key = None  # remove this key: make position_ids by ourselves
+        return key
+
+    keys = list(checkpoint.keys())
+    new_sd = {}
+    for key in keys:
+        new_key = convert_key(key)
+        if new_key is None:
+            continue
+        new_sd[new_key] = checkpoint[key]
+
+    for key in keys:
+        if ".resblocks" in key and ".attn.in_proj_" in key:
+            values = torch.chunk(checkpoint[key], 3)
+
+            key_suffix = ".weight" if "weight" in key else ".bias"
+            key_pfx = key.replace(SDXL_KEY_PREFIX + "transformer.resblocks.", "text_model.encoder.layers.")
+            key_pfx = key_pfx.replace("_weight", "")
+            key_pfx = key_pfx.replace("_bias", "")
+            key_pfx = key_pfx.replace(".attn.in_proj", ".self_attn.")
+            new_sd[key_pfx + "q_proj" + key_suffix] = values[0]
+            new_sd[key_pfx + "k_proj" + key_suffix] = values[1]
+            new_sd[key_pfx + "v_proj" + key_suffix] = values[2]
+
+    position_ids = torch.Tensor([list(range(max_length))]).to(torch.int64)
+    new_sd["text_model.embeddings.position_ids"] = position_ids
+
+    logit_scale = checkpoint.get(SDXL_KEY_PREFIX + "logit_scale", None)
+
+    return new_sd, logit_scale
+
+
+# load state_dict without allocating new tensors
+def _load_state_dict_on_device(model, state_dict, device, dtype=None, strict=False):
+    # dtype will use fp32 as default
+    missing_keys = list(model.state_dict().keys() - state_dict.keys())
+    unexpected_keys = list(state_dict.keys() - model.state_dict().keys())
+
+    # similar to model.load_state_dict()
+    if not missing_keys and not unexpected_keys:
+        for k in list(state_dict.keys()):
+            set_module_tensor_to_device(model, k, device, value=state_dict.pop(k), dtype=dtype)
+        return "<All keys matched successfully>"
+
+    # error_msgs
+    error_msgs: List[str] = []
+    if missing_keys:
+        error_msgs.insert(0, "Missing key(s) in state_dict: {}. ".format(", ".join('"{}"'.format(k) for k in missing_keys)))
+    if unexpected_keys:
+        error_msgs.insert(0, "Unexpected key(s) in state_dict: {}. ".format(", ".join('"{}"'.format(k) for k in unexpected_keys)))
+
+    if strict:
+        raise RuntimeError("Error(s) in loading state_dict for {}:\n\t{}".format(model.__class__.__name__, "\n\t".join(error_msgs)))
+    else:
+        for k in list(state_dict.keys()):
+            if k not in unexpected_keys:
+                set_module_tensor_to_device(model, k, device, value=state_dict.pop(k), dtype=dtype)
+        return "Error(s) in loading state_dict for {}:\n\t{}".format(model.__class__.__name__, "\n\t".join(error_msgs))
+
+
+def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None):
+    # model_version is reserved for future use
+    # dtype is used for full_fp16/bf16 integration. Text Encoder will remain fp32, because it runs on CPU when caching
+
+    # Load the state dict
+    if is_safetensors(ckpt_path):
+        checkpoint = None
+        try:
+            state_dict = load_file(ckpt_path, device=map_location)
+        except Exception as e:
+            print(e)
+            state_dict = load_file(ckpt_path)  # prevent device invalid Error
+        epoch = None
+        global_step = None
+    else:
+        checkpoint = torch.load(ckpt_path, map_location=map_location)
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+            epoch = checkpoint.get("epoch", 0)
+            global_step = checkpoint.get("global_step", 0)
+        else:
+            state_dict = checkpoint
+            epoch = 0
+            global_step = 0
+        checkpoint = None
+
+    # U-Net
+    print("building U-Net")
+    with init_empty_weights():
+        unet = SdxlUNet2DConditionModel()
+
+    print("loading U-Net from checkpoint")
+    unet_sd = {}
+    for k in list(state_dict.keys()):
+        if k.startswith("model.diffusion_model."):
+            unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
+    info = _load_state_dict_on_device(unet, unet_sd, device=map_location, dtype=dtype)
+    print("U-Net: ", info)
+
+    # Text Encoders
+    print("building text encoders")
+
+    # Text Encoder 1 is same to Stability AI's SDXL
+    text_model1_cfg = CLIPTextConfig(
+        vocab_size=49408,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        max_position_embeddings=77,
+        hidden_act="quick_gelu",
+        layer_norm_eps=1e-05,
+        dropout=0.0,
+        attention_dropout=0.0,
+        initializer_range=0.02,
+        initializer_factor=1.0,
+        pad_token_id=1,
+        bos_token_id=0,
+        eos_token_id=2,
+        model_type="clip_text_model",
+        projection_dim=768,
+        # torch_dtype="float32",
+        # transformers_version="4.25.0.dev0",
+    )
+    with init_empty_weights():
+        text_model1 = CLIPTextModel._from_config(text_model1_cfg)
+
+    # Text Encoder 2 is different from Stability AI's SDXL. SDXL uses open clip, but we use the model from HuggingFace.
+    # Note: Tokenizer from HuggingFace is different from SDXL. We must use open clip's tokenizer.
+    text_model2_cfg = CLIPTextConfig(
+        vocab_size=49408,
+        hidden_size=1280,
+        intermediate_size=5120,
+        num_hidden_layers=32,
+        num_attention_heads=20,
+        max_position_embeddings=77,
+        hidden_act="gelu",
+        layer_norm_eps=1e-05,
+        dropout=0.0,
+        attention_dropout=0.0,
+        initializer_range=0.02,
+        initializer_factor=1.0,
+        pad_token_id=1,
+        bos_token_id=0,
+        eos_token_id=2,
+        model_type="clip_text_model",
+        projection_dim=1280,
+        # torch_dtype="float32",
+        # transformers_version="4.25.0.dev0",
+    )
+    with init_empty_weights():
+        text_model2 = CLIPTextModelWithProjection(text_model2_cfg)
+
+    print("loading text encoders from checkpoint")
+    te1_sd = {}
+    te2_sd = {}
+    for k in list(state_dict.keys()):
+        if k.startswith("conditioner.embedders.0.transformer."):
+            te1_sd[k.replace("conditioner.embedders.0.transformer.", "")] = state_dict.pop(k)
+        elif k.startswith("conditioner.embedders.1.model."):
+            te2_sd[k] = state_dict.pop(k)
+
+    # 一部のposition_idsがないモデルへの対応 / add position_ids for some models
+    if "text_model.embeddings.position_ids" not in te1_sd:
+        te1_sd["text_model.embeddings.position_ids"] = torch.arange(77).unsqueeze(0)
+
+    info1 = _load_state_dict_on_device(text_model1, te1_sd, device=map_location)  # remain fp32
+    print("text encoder 1:", info1)
+
+    converted_sd, logit_scale = convert_sdxl_text_encoder_2_checkpoint(te2_sd, max_length=77)
+    info2 = _load_state_dict_on_device(text_model2, converted_sd, device=map_location)  # remain fp32
+    print("text encoder 2:", info2)
+
+    # prepare vae
+    print("building VAE")
+    vae_config = create_vae_diffusers_config()
+    with init_empty_weights():
+        vae = AutoencoderKL(**vae_config)
+
+    print("loading VAE from checkpoint")
+    converted_vae_checkpoint = convert_ldm_vae_checkpoint(state_dict, vae_config)
+    info = _load_state_dict_on_device(vae, converted_vae_checkpoint, device=map_location, dtype=dtype)
+    print("VAE:", info)
+
+    ckpt_info = (epoch, global_step) if epoch is not None else None
+    return text_model1, text_model2, vae, unet, logit_scale, ckpt_info
